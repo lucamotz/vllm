@@ -24,6 +24,7 @@ def test_prepare_attn_forwards_positions(monkeypatch: pytest.MonkeyPatch) -> Non
     state.max_model_len = 8192
     state._align_mode = False
     state.recoverssm = None
+    state._is_gdn = None
 
     positions = torch.tensor([1536], dtype=torch.int64)
     input_batch = SimpleNamespace(
