@@ -619,3 +619,45 @@ def test_update_block_table_only_for_mrv2_and_gdn_build():
         # MRV1 reuses metadata only at replay, which FULL graphs cannot follow.
         assert gdn.supports_update_block_table is use_v2
         assert not custom.supports_update_block_table
+
+
+@pytest.mark.parametrize("full_cuda_graph", [True, False])
+def test_pure_spec_decode_avoids_host_mask_gather(full_cuda_graph):
+    """Indexing a device tensor with a host mask copies the index to the device
+    with a blocking copy, i.e. a device sync; pure spec decode steps (padding
+    trails the spec rows) slice instead."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    case = GROUP_REUSE_CASES["spec_decode_padded"]
+    first, other = _create_v2_gdn_builders(2, 3, full_cuda_graph, "none")
+    common, extra_kwargs = _group_reuse_batch(case, 2)
+    # Tensors that live on the device in a real run.
+    device_storages = {
+        t.untyped_storage().data_ptr()
+        for t in (
+            common[0].block_table_tensor,
+            common[1].block_table_tensor,
+            extra_kwargs["num_accepted_tokens"],
+        )
+    }
+
+    class RecordDeviceGathers(TorchDispatchMode):
+        def __init__(self):
+            super().__init__()
+            self.gathers = 0
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            if (
+                func.overloadpacket.__name__ == "index"
+                and args[0].untyped_storage().data_ptr() in device_storages
+            ):
+                self.gathers += 1
+            return func(*args, **(kwargs or {}))
+
+    with RecordDeviceGathers() as recorded:
+        metadata = first.build(0, common[0], **extra_kwargs)
+        other.update_block_table(
+            metadata, common[1].block_table_tensor, common[1].slot_mapping
+        )
+    assert metadata.num_spec_decodes == 2
+    assert recorded.gathers == 0
