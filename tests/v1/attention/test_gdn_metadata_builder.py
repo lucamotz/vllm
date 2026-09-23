@@ -5,7 +5,9 @@ reclassification of non-spec decodes as prefills when spec decodes exist.
 Covers the fix for https://github.com/vllm-project/vllm/issues/34845.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -15,13 +17,15 @@ from tests.v1.attention.utils import (
     create_common_attn_metadata,
     create_vllm_config,
 )
-from vllm.config import SpeculativeConfig
+from vllm.config import SpeculativeConfig, VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionMetadata,
     GDNAttentionMetadataBuilder,
     gdn_precompute_metadata,
 )
+from vllm.v1.attention.backends.utils import mamba_get_block_table_tensor
 from vllm.v1.kv_cache_interface import MambaSpec
 
 BLOCK_SIZE = 16
@@ -315,3 +319,314 @@ def test_cudagraph_capture_batch_stays_decode_only():
     assert staged is not None
     assert staged.data_ptr() == builder.non_spec_state_indices_tensor.data_ptr()
     torch.testing.assert_close(staged, common_attn_metadata.block_table_tensor[:, 0])
+
+
+# MRV2 reuses the first kv-cache group's GDN metadata for later groups through
+# update_block_table(); the result must match a full build() of each group.
+@dataclass
+class GroupReuseCase:
+    # (kind, seq_len, query_len); kind is "spec", "decode", "prefill" or "pad".
+    rows: list[tuple[str, int, int]]
+    full_cuda_graph: bool
+    num_speculative_tokens: int = 3
+
+
+GROUP_REUSE_CASES = {
+    "spec_decode": GroupReuseCase(
+        [("spec", 40, 4), ("spec", 90, 4), ("spec", 17, 4)], True
+    ),
+    "spec_decode_padded": GroupReuseCase(
+        [("spec", 40, 4), ("spec", 90, 4), ("pad", 0, 0), ("pad", 0, 0)], True
+    ),
+    "spec_decode_dflash": GroupReuseCase(
+        [("spec", 60, 8)] * 5 + [("pad", 0, 0)] * 3, True, 7
+    ),
+    "spec_decode_piecewise": GroupReuseCase(
+        [("spec", 40, 4), ("spec", 90, 4)], False
+    ),
+    "spec_decode_and_prefill": GroupReuseCase(
+        [("spec", 40, 4), ("prefill", 30, 30), ("spec", 90, 4), ("prefill", 80, 20)],
+        True,
+    ),
+    "spec_decode_decode_and_prefill": GroupReuseCase(
+        [("spec", 40, 4), ("decode", 50, 1), ("prefill", 30, 30), ("pad", 0, 0)],
+        False,
+    ),
+    "decode": GroupReuseCase([("decode", 40, 1), ("decode", 90, 1)], True),
+    "decode_padded": GroupReuseCase(
+        [("decode", 40, 1), ("decode", 90, 1), ("pad", 0, 0)], True
+    ),
+    "decode_no_spec_config": GroupReuseCase(
+        [("decode", 40, 1), ("decode", 90, 1)], True, 0
+    ),
+    "decode_and_prefill": GroupReuseCase(
+        [("decode", 40, 1), ("decode", 90, 1), ("prefill", 30, 30)], True
+    ),
+}
+
+
+def _create_v2_gdn_builders(
+    num_builders: int,
+    num_speculative_tokens: int,
+    full_cuda_graph: bool,
+    mamba_cache_mode: str,
+) -> list[GDNAttentionMetadataBuilder]:
+    vllm_config = create_vllm_config(
+        model_name="Qwen/Qwen3.5-0.8B", block_size=BLOCK_SIZE
+    )
+    if full_cuda_graph:
+        vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
+    if num_speculative_tokens > 0:
+        vllm_config.speculative_config = SpeculativeConfig(
+            method="ngram", num_speculative_tokens=num_speculative_tokens
+        )
+    vllm_config.cache_config.mamba_cache_mode = mamba_cache_mode
+    mamba_spec = MambaSpec(
+        block_size=BLOCK_SIZE,
+        shapes=((16, 64),),
+        dtypes=(torch.float16,),
+        mamba_cache_mode=mamba_cache_mode,
+        num_speculative_blocks=num_speculative_tokens,
+    )
+    # The CPU test host cannot validate a config with MRV2 (it needs Triton).
+    with patch.object(VllmConfig, "use_v2_model_runner", property(lambda _: True)):
+        builders = [
+            GDNAttentionMetadataBuilder(
+                kv_cache_spec=mamba_spec,
+                layer_names=[f"layer.{i}"],
+                vllm_config=vllm_config,
+                device=DEVICE,
+            )
+            for i in range(num_builders)
+        ]
+    assert all(b.supports_update_block_table for b in builders)
+    return builders
+
+
+def _group_reuse_batch(
+    case: GroupReuseCase, num_groups: int
+) -> tuple[list[CommonAttentionMetadata], dict]:
+    rows = case.rows
+    query_lens = torch.tensor([r[2] for r in rows], dtype=torch.int32)
+    seq_lens = torch.tensor([r[1] for r in rows], dtype=torch.int32)
+    query_start_loc = torch.zeros(len(rows) + 1, dtype=torch.int32)
+    query_start_loc[1:] = query_lens.cumsum(0)
+    is_pad = torch.tensor([r[0] == "pad" for r in rows])
+    num_blocks = 32
+    common = []
+    for group in range(num_groups):
+        generator = torch.Generator().manual_seed(group)
+        block_table = torch.randint(
+            1, 1000, (len(rows), num_blocks), dtype=torch.int32, generator=generator
+        )
+        block_table[is_pad] = 0
+        num_tokens = int(query_start_loc[-1])
+        common.append(
+            CommonAttentionMetadata(
+                query_start_loc=query_start_loc.to(DEVICE),
+                query_start_loc_cpu=query_start_loc,
+                seq_lens=seq_lens.to(DEVICE),
+                seq_lens_cpu_upper_bound=seq_lens,
+                num_reqs=len(rows),
+                num_actual_tokens=num_tokens,
+                max_query_len=int(query_lens.max()),
+                max_seq_len=int(seq_lens.max()),
+                block_table_tensor=block_table.to(DEVICE),
+                slot_mapping=torch.full((num_tokens,), group, dtype=torch.int64),
+                causal=True,
+                is_prefilling=torch.tensor([r[0] == "prefill" for r in rows]),
+            )
+        )
+    extra_kwargs = {}
+    if case.num_speculative_tokens > 0:
+        extra_kwargs = {
+            "num_accepted_tokens": torch.arange(1, len(rows) + 1, dtype=torch.int32),
+            "num_decode_draft_tokens_cpu": torch.tensor(
+                [r[2] - 1 if r[0] == "spec" else -1 for r in rows],
+                dtype=torch.int32,
+            ),
+        }
+    return common, extra_kwargs
+
+
+def _assert_same(actual, expected, name: str) -> None:
+    if isinstance(expected, torch.Tensor):
+        assert isinstance(actual, torch.Tensor), name
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0, msg=name)
+    elif isinstance(expected, dict):
+        assert isinstance(actual, dict) and actual.keys() == expected.keys(), name
+        for key in expected:
+            _assert_same(actual[key], expected[key], f"{name}[{key}]")
+    elif isinstance(expected, list):
+        assert isinstance(actual, list) and len(actual) == len(expected), name
+        for i, (a, e) in enumerate(zip(actual, expected)):
+            _assert_same(a, e, f"{name}[{i}]")
+    else:
+        assert actual == expected, f"{name}: {actual} != {expected}"
+
+
+def _assert_metadata_equal(
+    actual: GDNAttentionMetadata, expected: GDNAttentionMetadata
+) -> None:
+    for field in fields(GDNAttentionMetadata):
+        _assert_same(
+            getattr(actual, field.name), getattr(expected, field.name), field.name
+        )
+
+
+def _set_aligned_state_indices(builder, common: CommonAttentionMetadata) -> None:
+    # MRV2 computes these for every group in one fused launch.
+    builder.mamba_aligned_state_indices = mamba_get_block_table_tensor(
+        common.block_table_tensor, common.seq_lens, builder.kv_cache_spec, "align"
+    )
+
+
+@pytest.mark.parametrize("mamba_cache_mode", ["none", "align"])
+@pytest.mark.parametrize(
+    "case", GROUP_REUSE_CASES.values(), ids=GROUP_REUSE_CASES.keys()
+)
+def test_update_block_table_matches_build(case: GroupReuseCase, mamba_cache_mode):
+    num_groups = 3
+    reused = _create_v2_gdn_builders(
+        num_groups, case.num_speculative_tokens, case.full_cuda_graph, mamba_cache_mode
+    )
+    reference = _create_v2_gdn_builders(
+        num_groups, case.num_speculative_tokens, case.full_cuda_graph, mamba_cache_mode
+    )
+    common, extra_kwargs = _group_reuse_batch(case, num_groups)
+    if mamba_cache_mode == "align":
+        for builders in (reused, reference):
+            for builder, group_common in zip(builders, common):
+                _set_aligned_state_indices(builder, group_common)
+
+    first = reused[0].build(0, common[0], **extra_kwargs)
+    _assert_metadata_equal(first, reference[0].build(0, common[0], **extra_kwargs))
+    for group in range(1, num_groups):
+        actual = reused[group].update_block_table(
+            first, common[group].block_table_tensor, common[group].slot_mapping
+        )
+        expected = reference[group].build(0, common[group], **extra_kwargs)
+        _assert_metadata_equal(actual, expected)
+        # Only the state indices are per group; FULL-graph staging writes them
+        # into this group's buffers and shares the first group's batch buffers.
+        for name in ("spec_state_indices_tensor", "non_spec_state_indices_tensor"):
+            buffer = getattr(reused[group], name)
+            staged = getattr(actual, name)
+            expected_staged = getattr(expected, name)
+            is_staged = (
+                expected_staged is not None
+                and expected_staged.data_ptr()
+                == getattr(reference[group], name).data_ptr()
+            )
+            assert (staged is not None and staged.data_ptr() == buffer.data_ptr()) == (
+                is_staged
+            ), name
+        for name in (
+            "spec_query_start_loc",
+            "non_spec_query_start_loc",
+            "spec_sequence_masks",
+            "spec_token_indx",
+            "non_spec_token_indx",
+            "num_accepted_tokens",
+            "has_initial_state",
+            "chunk_indices",
+        ):
+            assert getattr(actual, name) is getattr(first, name), name
+
+
+def test_aligned_state_indices_match_gather():
+    """Precomputed align-mode state indices must match the per-group gather."""
+    case = GROUP_REUSE_CASES["spec_decode_and_prefill"]
+    builders = _create_v2_gdn_builders(2, 3, True, "align")
+    common, extra_kwargs = _group_reuse_batch(case, 1)
+    _set_aligned_state_indices(builders[0], common[0])
+    _assert_metadata_equal(
+        builders[0].build(0, common[0], **extra_kwargs),
+        builders[1].build(0, common[0], **extra_kwargs),
+    )
+
+
+@pytest.mark.parametrize("for_cudagraph_capture", [False, True])
+@pytest.mark.parametrize("case_name", ["spec_decode_padded", "decode_and_prefill"])
+def test_build_attn_metadata_reuses_gdn_groups(for_cudagraph_capture, case_name):
+    from vllm.v1.attention.backends.gdn_attn import GDNAttentionBackend
+    from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
+    from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridAttnMetadata
+    from vllm.v1.worker.utils import AttentionGroup
+
+    case = GROUP_REUSE_CASES[case_name]
+    if for_cudagraph_capture:
+        case = GroupReuseCase([("spec", 40, 4), ("spec", 90, 4)], True)
+    num_groups = 3
+    builders = _create_v2_gdn_builders(
+        num_groups, case.num_speculative_tokens, case.full_cuda_graph, "none"
+    )
+    reference = _create_v2_gdn_builders(
+        num_groups, case.num_speculative_tokens, case.full_cuda_graph, "none"
+    )
+    common, extra_kwargs = _group_reuse_batch(case, num_groups)
+    attn_groups = []
+    for group, builder in enumerate(builders):
+        attn_group = AttentionGroup(
+            GDNAttentionBackend, builder.layer_names, builder.kv_cache_spec, group
+        )
+        attn_group.metadata_builders = [builder]
+        attn_groups.append([attn_group])
+    m = common[0]
+    attn_metadata = build_attn_metadata(
+        attn_groups=attn_groups,
+        num_reqs=m.num_reqs,
+        num_tokens=m.num_actual_tokens,
+        query_start_loc_gpu=m.query_start_loc,
+        query_start_loc_cpu=m.query_start_loc_cpu,
+        max_query_len=m.max_query_len,
+        seq_lens=m.seq_lens,
+        max_seq_len=m.max_seq_len,
+        block_tables=[c.block_table_tensor for c in common],
+        slot_mappings=torch.stack([c.slot_mapping for c in common]),
+        kv_cache_config=SimpleNamespace(kv_cache_groups=[None] * num_groups),
+        seq_lens_cpu_upper_bound=m.seq_lens_cpu_upper_bound,
+        model_specific_attn_metadata=MambaHybridAttnMetadata(
+            is_prefilling=m.is_prefilling,
+            num_accepted_tokens=extra_kwargs.get("num_accepted_tokens"),
+            num_decode_draft_tokens_cpu=extra_kwargs.get(
+                "num_decode_draft_tokens_cpu"
+            ),
+        ),
+        for_cudagraph_capture=for_cudagraph_capture,
+    )
+    first = attn_metadata["layer.0"]
+    for group in range(num_groups):
+        actual = attn_metadata[f"layer.{group}"]
+        if for_cudagraph_capture:
+            expected = reference[group].build_for_cudagraph_capture(common[group])
+        else:
+            expected = reference[group].build(0, common[group], **extra_kwargs)
+        _assert_metadata_equal(actual, expected)
+        # Later groups read the first group's batch-level buffers, also in the
+        # capture-time metadata a FULL graph would bake in.
+        assert actual.non_spec_query_start_loc is first.non_spec_query_start_loc
+        assert actual.spec_query_start_loc is first.spec_query_start_loc
+
+
+def test_update_block_table_only_for_mrv2_and_gdn_build():
+    vllm_config = create_vllm_config(
+        model_name="Qwen/Qwen3.5-0.8B", block_size=BLOCK_SIZE
+    )
+    mamba_spec = MambaSpec(
+        block_size=BLOCK_SIZE, shapes=((16, 64),), dtypes=(torch.float16,)
+    )
+
+    class CustomBuild(GDNAttentionMetadataBuilder):
+        def build(self, *args, **kwargs):  # type: ignore[override]
+            return super().build(*args, **kwargs)
+
+    for use_v2 in (False, True):
+        with patch.object(
+            VllmConfig, "use_v2_model_runner", property(lambda _: use_v2)
+        ):
+            gdn = GDNAttentionMetadataBuilder(mamba_spec, ["l"], vllm_config, DEVICE)
+            custom = CustomBuild(mamba_spec, ["l"], vllm_config, DEVICE)
+        # MRV1 reuses metadata only at replay, which FULL graphs cannot follow.
+        assert gdn.supports_update_block_table is use_v2
+        assert not custom.supports_update_block_table
