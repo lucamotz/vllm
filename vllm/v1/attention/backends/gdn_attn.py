@@ -343,10 +343,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 non_spec_token_indx = torch.empty(
                     0, dtype=torch.int32, device=query_start_loc.device
                 )
-                # Filter by spec_sequence_masks to exclude padded sequences
+                # Padded sequences trail the spec decodes, so slice them off
+                # rather than gather with the host mask (its index copy syncs).
                 spec_state_indices_tensor = block_table_tensor[
-                    spec_sequence_masks_cpu, : self.num_spec + 1
-                ]
+                    :num_spec_decodes, : self.num_spec + 1
+                ].contiguous()
                 non_spec_state_indices_tensor = None
                 # Padded sequences are always at the back, so the first
                 # num_spec_decodes + 1 entries of query_start_loc already
@@ -403,7 +404,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 )
 
             assert num_accepted_tokens is not None
-            num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
+            if num_prefills == 0 and num_decodes == 0:
+                num_accepted_tokens = num_accepted_tokens[:num_spec_decodes]
+            else:
+                num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
 
         chunk_indices: torch.Tensor | None = None
         chunk_offsets: torch.Tensor | None = None
@@ -599,20 +603,16 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             )
             block_table_tensor = blk_table
 
-        stage_spec_decode = self._stage_spec_decode(
-            m.num_prefills, m.num_decodes, m.num_spec_decodes, m.num_spec_decode_tokens
-        )
         spec_state_indices_tensor = None
         non_spec_state_indices_tensor = None
         spec_masks_cpu = m.spec_sequence_masks_cpu
         if spec_masks_cpu is None:
             non_spec_state_indices_tensor = block_table_tensor[:, 0]
-        elif stage_spec_decode:
-            # All rows are spec decodes followed by padding, so slice instead of
-            # gathering with the host mask (which syncs to copy the indices).
+        elif m.num_prefills == 0 and m.num_decodes == 0:
+            # Same as build(): padded sequences trail the spec decodes.
             spec_state_indices_tensor = block_table_tensor[
                 : m.num_spec_decodes, : self.num_spec + 1
-            ]
+            ].contiguous()
         else:
             spec_state_indices_tensor = block_table_tensor[
                 spec_masks_cpu, : self.num_spec + 1
@@ -627,7 +627,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             if spec_masks_cpu is None and m.num_decodes > 0:
                 prefill_state_indices = prefill_state_indices[m.num_decodes :]
 
-        if stage_spec_decode:
+        if self._stage_spec_decode(
+            m.num_prefills, m.num_decodes, m.num_spec_decodes, m.num_spec_decode_tokens
+        ):
             assert m.spec_state_indices_tensor is not None
             assert spec_state_indices_tensor is not None
             batch_size = m.spec_state_indices_tensor.shape[0]
