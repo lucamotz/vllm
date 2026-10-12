@@ -10,7 +10,6 @@ from vllm.distributed.device_communicators.base_device_communicator import (
 )
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
-from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 from vllm.utils.flashinfer import nvfp4_block_scale_interleave
 
 
@@ -163,19 +162,12 @@ def flashinfer_alltoall_dispatch(
     topk_weights = topk_weights.view(dtype=orig_topk_weights_dtype)
 
     if not defer_input_quant:
-        x, x_sf = moe_kernel_quantize_input(
+        x, x_sf = quant_config.quantize_input(
             x,
             gs,
-            quant_config.quant_dtype,
-            quant_config.per_act_token_quant,
-            quant_config.block_shape,
-            # NOTE: swizzling pads the scales to multiple of 128
-            # which makes the scales tensor different shape than
-            # the hidden states, breaking the A2A kernel. So, we
-            # delay the swizzling until after the A2A.
+            # Swizzling pads scales, breaking A2A shapes; delay it until after A2A.
             is_scale_swizzled=False,
             mx_alignment=quant_config.mx_alignment,
-            use_ue8m0=quant_config.use_ue8m0,
         )
 
         x = MnnvlMoe.mnnvl_moe_alltoallv(

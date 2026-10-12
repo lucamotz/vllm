@@ -10,7 +10,6 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceDelegate,
     TopKWeightAndReduceNoOP,
 )
-from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 from vllm.utils.flashinfer import nvfp4_block_scale_interleave
 
 
@@ -34,15 +33,11 @@ def _quantize_and_setup_dispatch(
         # which makes the scales tensor different shape than
         # the hidden states, breaking the A2A kernel. So, we
         # delay the swizzling until after the A2A.
-        a1q, a1q_scale = moe_kernel_quantize_input(
+        a1q, a1q_scale = quant_config.quantize_input(
             a1,
             input_sf,
-            quant_dtype=quant_config.quant_dtype,
-            per_act_token_quant=quant_config.per_act_token_quant,
-            block_shape=quant_config.block_shape,
             is_scale_swizzled=False,
             mx_alignment=quant_config.mx_alignment,
-            use_ue8m0=quant_config.use_ue8m0,
         )
 
     # Skip gathering scales if we have static quantization

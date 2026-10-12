@@ -347,7 +347,6 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                     per_act_token_quant=False,
                     block_shape=quant_config.block_shape,
                     is_scale_swizzled=quant_config.is_scale_swizzled,
-                    use_ue8m0=quant_config.use_ue8m0,
                 )
 
         return (
@@ -383,15 +382,11 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             # Scales must be row-major [num_tokens, ...] here so each token's
             # scales can be shuffled with it; any swizzling the expert kernel
             # wants is applied post-dispatch in `_receiver`.
-            a1q, a1q_scale = moe_kernel_quantize_input(
+            a1q, a1q_scale = quant_config.quantize_input(
                 a1,
                 quant_config.a1_scale,
-                quant_dtype=quant_config.quant_dtype,
-                per_act_token_quant=quant_config.per_act_token_quant,
-                block_shape=quant_config.block_shape,
                 is_scale_swizzled=False,
                 mx_alignment=quant_config.mx_alignment,
-                use_ue8m0=quant_config.use_ue8m0,
             )
             if a1q_scale is not None and a1q_scale.numel() == 1:
                 a1q_scale = a1q_scale.view(1, 1)

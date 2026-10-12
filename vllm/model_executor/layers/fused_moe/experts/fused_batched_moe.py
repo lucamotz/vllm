@@ -20,7 +20,6 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
 )
 from vllm.model_executor.layers.fused_moe.utils import (
     _resize_cache,
-    moe_kernel_quantize_input,
     normalize_batched_scales_shape,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -714,11 +713,11 @@ def batched_moe_kernel_quantize_input(
     E: int,
     N: int,
     expert_num_tokens: torch.Tensor,
-    qtype: torch.dtype | None,
-    per_act_token_quant: bool,
-    block_shape: list[int] | None = None,
-    use_ue8m0: bool | None = None,
+    quant_config: FusedMoEQuantConfig,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    qtype = quant_config.quant_dtype
+    per_act_token_quant = quant_config.per_act_token_quant
+    block_shape = quant_config.block_shape
     if _is_capturing_or_compiling():
         # Note: this does a bunch of extra work because expert_num_tokens is
         # ignored but it does support torch.compile + cudagraphs.
@@ -726,13 +725,9 @@ def batched_moe_kernel_quantize_input(
         assert A_scale is None or A_scale.ndim <= 2, (
             f"{A_scale.shape if A_scale is not None else None}"
         )
-        A_q, A_q_scale = moe_kernel_quantize_input(
+        A_q, A_q_scale = quant_config.quantize_input(
             A.view(-1, hidden_dim),
             A_scale,
-            qtype,
-            per_act_token_quant,
-            block_shape,
-            use_ue8m0=use_ue8m0,
         )
         A_q = A_q.view(E, -1, hidden_dim)
         A_q_scale = normalize_batched_scales_shape(A_q_scale, E)
@@ -766,13 +761,9 @@ def batched_moe_kernel_quantize_input(
                     scales = A_scale[e, : min(num_tokens, A_scale.shape[1])]
                 else:
                     scales = None
-                A_q[e, :num_tokens], tmp_scale = moe_kernel_quantize_input(
+                A_q[e, :num_tokens], tmp_scale = quant_config.quantize_input(
                     A[e, :num_tokens],
                     scales,
-                    qtype,
-                    per_act_token_quant,
-                    block_shape,
-                    use_ue8m0=use_ue8m0,
                 )
                 assert tmp_scale is not None
                 A_q_scale[e, : tmp_scale.shape[0]] = tmp_scale
@@ -1014,10 +1005,7 @@ class BatchedTritonExperts(mk.FusedMoEExpertsModular):
             E,
             N,
             expert_num_tokens,
-            self.quant_dtype,
-            self.per_act_token_quant,
-            self.block_shape,
-            use_ue8m0=self.quant_config.use_ue8m0,
+            self.quant_config,
         )
 
         invoke_moe_batched_triton_kernel(

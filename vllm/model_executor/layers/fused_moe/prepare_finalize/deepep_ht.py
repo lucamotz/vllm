@@ -251,7 +251,6 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                     per_act_token_quant=False,
                     block_shape=quant_config.block_shape,
                     is_scale_swizzled=quant_config.is_scale_swizzled,
-                    use_ue8m0=quant_config.use_ue8m0,
                 )
 
         return (
@@ -290,13 +289,9 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         # * For expert kernels that require unquantized inputs,
         #   defer quantization to FusedMoEExpertsPermuteUnpermute.
         if quant_config.is_block_quantized and not defer_input_quant:
-            a1q, a1q_scale = moe_kernel_quantize_input(
+            a1q, a1q_scale = quant_config.quantize_input(
                 a1,
                 quant_config.a1_scale,
-                quant_dtype=quant_config.quant_dtype,
-                per_act_token_quant=quant_config.per_act_token_quant,
-                block_shape=quant_config.block_shape,
-                use_ue8m0=quant_config.use_ue8m0,
             )
             if a1q_scale is not None and a1q_scale.numel() == 1:
                 a1q_scale = a1q_scale.view(1, 1)

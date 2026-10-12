@@ -268,6 +268,28 @@ class FusedMoEQuantConfig:
             "illegal quantization"
         )
 
+    def quantize_input(
+        self,
+        x: torch.Tensor,
+        scale: torch.Tensor | None,
+        *,
+        is_scale_swizzled: bool = True,
+        mx_alignment: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Quantize an activation using this layer's quantization settings."""
+        from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
+
+        return moe_kernel_quantize_input(
+            x,
+            scale,
+            self.quant_dtype,
+            self.per_act_token_quant,
+            self.block_shape,
+            is_scale_swizzled=is_scale_swizzled,
+            mx_alignment=mx_alignment,
+            use_ue8m0=self.use_ue8m0,
+        )
+
     #
     # Convenience accessors for various properties.
     #

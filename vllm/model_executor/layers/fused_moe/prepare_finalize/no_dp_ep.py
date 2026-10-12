@@ -8,7 +8,6 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceContiguous,
     TopKWeightAndReduceDelegate,
 )
-from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 
 
 def _quantize_input(
@@ -24,15 +23,11 @@ def _quantize_input(
     input_sf = (
         quant_config.a1_gscale if quant_config.use_nvfp4_w4a4 else quant_config.a1_scale
     )
-    a1q, a1q_scale = moe_kernel_quantize_input(
+    a1q, a1q_scale = quant_config.quantize_input(
         a1,
         input_sf,
-        quant_dtype=quant_config.quant_dtype,
-        per_act_token_quant=quant_config.per_act_token_quant,
-        block_shape=quant_config.block_shape,
         is_scale_swizzled=quant_config.is_scale_swizzled,
         mx_alignment=quant_config.mx_alignment,
-        use_ue8m0=quant_config.use_ue8m0,
     )
 
     return a1q, a1q_scale

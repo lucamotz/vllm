@@ -9,7 +9,6 @@ from vllm.distributed.device_communicators.base_device_communicator import (
 )
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
-from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 from vllm.utils.flashinfer import nvfp4_block_scale_interleave
 
 
@@ -100,15 +99,11 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
         if defer_input_quant:
             dispatch_x, dispatch_x_sf = a1, None
         else:
-            dispatch_x, dispatch_x_sf = moe_kernel_quantize_input(
+            dispatch_x, dispatch_x_sf = quant_config.quantize_input(
                 a1,
                 quant_config.a1_gscale,
-                quant_config.quant_dtype,
-                quant_config.per_act_token_quant,
-                quant_config.block_shape,
                 is_scale_swizzled=False,  # delay swizzle to after comm
                 mx_alignment=quant_config.mx_alignment,
-                use_ue8m0=quant_config.use_ue8m0,
             )
 
         payloads = [dispatch_x]

@@ -10,7 +10,6 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNaiveBatched,
 )
 from vllm.model_executor.layers.fused_moe.utils import (
-    moe_kernel_quantize_input,
     normalize_scales_shape,
 )
 
@@ -140,13 +139,9 @@ class BatchedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                         rhs_a1_scale = a1_scale
                 else:
                     rhs_a1_scale = None
-                b_a1[idx, :rows, :], b_s = moe_kernel_quantize_input(
+                b_a1[idx, :rows, :], b_s = quant_config.quantize_input(
                     rhs,
                     rhs_a1_scale,
-                    quant_config.quant_dtype,
-                    quant_config.per_act_token_quant,
-                    quant_config.block_shape,
-                    use_ue8m0=quant_config.use_ue8m0,
                 )
                 assert b_s is not None
                 if quant_config.is_per_act_token:
