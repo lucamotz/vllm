@@ -5,6 +5,7 @@
 Run `pytest tests/quantization/test_fp8.py --forked`.
 """
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -42,6 +43,8 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.platforms import current_platform
+from vllm.utils.deep_gemm import is_deep_gemm_e8m0_used, is_deep_gemm_supported
+from vllm.utils.torch_utils import set_default_torch_dtype
 
 DEVICE_TYPE = current_platform.device_type
 
@@ -54,6 +57,86 @@ MODELS = [
         marks=pytest.mark.skip(reason="Checkpoint removed from HF."),
     ),
 ]
+
+
+@pytest.mark.skipif(not is_deep_gemm_e8m0_used(), reason="Requires DeepGEMM E8M0")
+@pytest.mark.parametrize("disable_deep_gemm", [True, False])
+def test_fp8_moe_scale_policy_belongs_to_layer(
+    dist_init, default_vllm_config, disable_deep_gemm
+):
+    """Draft layers retain their scale policy under the target's context."""
+    from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
+    from vllm.model_executor.layers.fused_moe.prepare_finalize.no_dp_ep import (
+        MoEPrepareAndFinalizeNoDPEPModular,
+    )
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        per_token_group_quant_fp8,
+    )
+
+    config = default_vllm_config
+    config.quant_config = Fp8Config(weight_block_size=[128, 128])
+    config.quant_config.use_deep_gemm = False if disable_deep_gemm else None
+    with torch.device("cuda"):
+        layer = FusedMoEFactory(
+            num_experts=2,
+            top_k=1,
+            hidden_size=256,
+            intermediate_size=256,
+            params_dtype=torch.bfloat16,
+            quant_config=config.quant_config,
+        ).routed_experts
+
+    method = layer.quant_method
+    assert isinstance(method, Fp8MoEMethod)
+    if disable_deep_gemm:
+        assert method.fp8_backend not in (
+            Fp8MoeBackend.DEEPGEMM,
+            Fp8MoeBackend.BATCHED_DEEPGEMM,
+        )
+
+    # Process the draft's weights and activations under the opposite policy.
+    config.quant_config = Fp8Config(weight_block_size=[128, 128])
+    config.quant_config.use_deep_gemm = disable_deep_gemm
+    quant_config = method.get_fused_moe_quant_config(layer)
+    x = torch.full((16, 256), 3.0, dtype=torch.bfloat16, device="cuda")
+    topk_ids = torch.zeros((16, 1), dtype=torch.int32, device="cuda")
+    topk_weights = torch.ones((16, 1), device="cuda")
+    with set_forward_context(None, config):
+        _, scales, *_ = MoEPrepareAndFinalizeNoDPEPModular().prepare(
+            x, topk_weights, topk_ids, 2, None, False, quant_config
+        )
+    _, expected_scales = per_token_group_quant_fp8(
+        x, 128, use_ue8m0=not disable_deep_gemm
+    )
+    torch.testing.assert_close(scales, expected_scales, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not is_deep_gemm_supported(), reason="Requires DeepGEMM")
+@pytest.mark.parametrize("disable_deep_gemm", [True, False])
+def test_fp8_linear_policy_belongs_to_layer(
+    dist_init, default_vllm_config, disable_deep_gemm
+):
+    """Kernel selection honors the layer policy under another model's config."""
+    from vllm.model_executor.kernels.linear import DeepGemmFp8BlockScaledMMKernel
+
+    config = default_vllm_config
+    config.model_config = SimpleNamespace(dtype=torch.bfloat16)
+    quant_config = Fp8Config(weight_block_size=[128, 128])
+    quant_config.use_deep_gemm = False if disable_deep_gemm else None
+    with set_default_torch_dtype(torch.bfloat16):
+        method = Fp8LinearMethod(quant_config)
+    config.kernel_config.linear_backend = "deep_gemm"
+    config.model_config.hf_text_config = SimpleNamespace(
+        model_type="other" if disable_deep_gemm else "qwen3_5_text"
+    )
+    expect = (
+        pytest.raises(ValueError, match="DeepGEMM is disabled")
+        if disable_deep_gemm
+        else nullcontext()
+    )
+    with torch.device("cuda"), expect:
+        method.create_weights(torch.nn.Module(), 256, [256], 256, 256, torch.bfloat16)
+        assert isinstance(method.fp8_linear, DeepGemmFp8BlockScaledMMKernel)
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="DSV4.1 requires CUDA")

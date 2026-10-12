@@ -396,6 +396,7 @@ def select_fp8_moe_backend(
     weight_key: QuantKey | None,
     activation_key: QuantKey | None,
     allow_vllm_cutlass: bool = False,
+    use_deep_gemm: bool | None = None,
 ) -> tuple[Fp8MoeBackend, type[mk.FusedMoEExperts] | None]:
     """Select the primary FP8 MoE backend
     Note: Shape-specific fallbacks may still occur at runtime.
@@ -438,6 +439,11 @@ def select_fp8_moe_backend(
         activation_key: QuantKey | None,
         activation_format: mk.FusedMoEActivationFormat,
     ) -> tuple[Fp8MoeBackend, type[mk.FusedMoEExperts]]:
+        if use_deep_gemm is False and backend in (
+            Fp8MoeBackend.DEEPGEMM,
+            Fp8MoeBackend.BATCHED_DEEPGEMM,
+        ):
+            raise ValueError("DeepGEMM is disabled for this layer.")
         for k_cls in backend_to_kernel_cls(backend):
             supported, reason = k_cls.is_supported_config(
                 k_cls, config, weight_key, activation_key, activation_format
@@ -477,8 +483,16 @@ def select_fp8_moe_backend(
         )
 
     # Handle explicit DeepGEMM FP8 configuration.
-    if envs.is_set("VLLM_USE_DEEP_GEMM") or envs.is_set("VLLM_MOE_USE_DEEP_GEMM"):
-        if not envs.VLLM_USE_DEEP_GEMM or not envs.VLLM_MOE_USE_DEEP_GEMM:
+    if (
+        use_deep_gemm is False
+        or envs.is_set("VLLM_USE_DEEP_GEMM")
+        or envs.is_set("VLLM_MOE_USE_DEEP_GEMM")
+    ):
+        if (
+            use_deep_gemm is False
+            or not envs.VLLM_USE_DEEP_GEMM
+            or not envs.VLLM_MOE_USE_DEEP_GEMM
+        ):
             AVAILABLE_BACKENDS.remove(Fp8MoeBackend.DEEPGEMM)
             AVAILABLE_BACKENDS.remove(Fp8MoeBackend.BATCHED_DEEPGEMM)
         else:

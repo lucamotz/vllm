@@ -18,6 +18,7 @@ from vllm.model_executor.layers.quantization.utils.ocp_mx_utils import (
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
 from vllm.platforms import current_platform
+from vllm.utils.deep_gemm import is_deep_gemm_e8m0_used
 from vllm.utils.import_utils import get_triton_kernels_version
 from vllm.utils.math_utils import cdiv
 
@@ -249,6 +250,7 @@ class FusedMoEQuantConfig:
     _w1: FusedMoEQuantDesc
     _w2: FusedMoEQuantDesc
     is_scale_swizzled: bool = True
+    use_ue8m0: bool | None = None
 
     # MXFP4-specific TRTLLM parameters for SwiGLU activation clamping.
     # These correspond to gemm1_alpha, gemm1_beta, gemm1_clamp_limit
@@ -260,6 +262,8 @@ class FusedMoEQuantConfig:
     mx_alignment: int = 0
 
     def __post_init__(self):
+        if self.use_ue8m0 is None and self.use_fp8_w8a8 and self.is_block_quantized:
+            self.use_ue8m0 = is_deep_gemm_e8m0_used()
         assert not self.per_act_token_quant or self.block_shape is None, (
             "illegal quantization"
         )

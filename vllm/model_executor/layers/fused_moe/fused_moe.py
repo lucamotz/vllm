@@ -1473,6 +1473,7 @@ def fused_experts_op(
     block_shape: list[int] | None = None,
     w1_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
+    use_ue8m0: bool | None = None,
 ) -> torch.Tensor:
     return fused_experts_impl(
         hidden_states,
@@ -1499,6 +1500,7 @@ def fused_experts_op(
         block_shape,
         w1_bias,
         w2_bias,
+        use_ue8m0,
     )
 
 
@@ -1527,6 +1529,7 @@ def fused_experts_op_fake(
     block_shape: list[int] | None = None,
     w1_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
+    use_ue8m0: bool | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
@@ -1628,6 +1631,7 @@ def fused_experts(
         block_shape=quant_config.block_shape,
         w1_bias=quant_config.w1_bias,
         w2_bias=quant_config.w2_bias,
+        use_ue8m0=quant_config.use_ue8m0,
     )
 
 
@@ -1674,6 +1678,7 @@ def fused_experts_impl(
     block_shape: list[int] | None = None,
     w1_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
+    use_ue8m0: bool | None = None,
 ) -> torch.Tensor:
     if ocp_mx_scheme is not None:
         raise NotImplementedError(
@@ -1769,6 +1774,7 @@ def fused_experts_impl(
         quant_dtype=quant_dtype,
         per_act_token_quant=per_channel_quant,
         block_shape=block_shape,
+        use_ue8m0=use_ue8m0,
     )
 
     sorted_token_ids, expert_ids, num_tokens_post_padded = _prepare_expert_assignment(
@@ -1818,6 +1824,7 @@ def fused_experts_impl(
         quant_dtype=quant_dtype,
         per_act_token_quant=per_channel_quant,
         block_shape=block_shape,
+        use_ue8m0=use_ue8m0,
     )
 
     if expert_map is not None:

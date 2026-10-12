@@ -1531,10 +1531,9 @@ class VllmConfig:
             if should_auto_disable_deep_gemm(model_type):
                 self.quant_config.use_deep_gemm = False
                 logger.warning_once(
-                    "Auto-disabled DeepGemm for model_type=%s on Blackwell. "
-                    "DeepGemm E8M0 scale format causes accuracy degradation "
-                    "for this architecture. Falling back to CUTLASS. "
-                    "To disable DeepGemm globally, set VLLM_USE_DEEP_GEMM=0.",
+                    "Auto-disabled DeepGEMM for model_type=%s on this GPU "
+                    "due to known accuracy issues. "
+                    "To disable DeepGEMM globally, set VLLM_USE_DEEP_GEMM=0.",
                     model_type,
                 )
 

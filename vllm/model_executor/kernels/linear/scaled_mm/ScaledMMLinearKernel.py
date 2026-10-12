@@ -36,6 +36,7 @@ class FP8ScaledMMLinearLayerConfig(MMLinearLayerConfig):
     weight_shape: tuple[int, int]
     input_dtype: torch.dtype
     out_dtype: torch.dtype
+    use_deep_gemm: bool | None = None
 
 
 _FP8ParamsT = tuple[

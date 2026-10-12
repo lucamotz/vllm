@@ -35,9 +35,6 @@ from vllm.model_executor.layers.fused_moe.utils import (
     moe_kernel_quantize_input,
     swiglu_limit_func,
 )
-from vllm.model_executor.layers.quantization.utils.fp8_utils import (
-    is_deep_gemm_e8m0_used,
-)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     FP8_DTYPE,
     QuantKey,
@@ -296,6 +293,7 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 self.per_act_token_quant,
                 self.block_shape,
                 quantization_emulation=self.quantization_emulation,
+                use_ue8m0=self.quant_config.use_ue8m0,
             )
 
         E, num_tokens, N, K, top_k_num = self.moe_problem_size(
@@ -507,7 +505,7 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             and self.quant_config.use_fp8_w8a8
             and self.block_shape == [128, 128]
             and lora_context is None
-            and not is_deep_gemm_e8m0_used()
+            and not self.quant_config.use_ue8m0
         ):
             qintermediate_cache2, a2q_scale = ops.silu_and_mul_per_block_quant(
                 intermediate_cache1.view(-1, N),
@@ -526,6 +524,7 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 self.per_act_token_quant,
                 self.block_shape,
                 quantization_emulation=self.quantization_emulation,
+                use_ue8m0=self.quant_config.use_ue8m0,
             )
 
         # LoRA w2: applied to intermediate_cache3 before moe_sum, using the

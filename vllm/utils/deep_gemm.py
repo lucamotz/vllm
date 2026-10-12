@@ -24,9 +24,10 @@ from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_deep_gemm
 from vllm.utils.math_utils import cdiv
 
-_DEEPGEMM_BLACKWELL_EXCLUDED_MODEL_TYPES: set[str] = {
-    "qwen3_5_text",
-    "qwen3_5_moe_text",
+_DEEPGEMM_EXCLUDED_MODEL_TYPES: dict[str, tuple[int, ...]] = {
+    "qwen3_5_text": (100, 120),
+    "qwen3_5_moe_text": (100, 120),
+    "kolibri1": (90, 100, 120),
 }
 
 
@@ -37,19 +38,13 @@ def get_paged_mqa_page_sizes() -> tuple[int, ...]:
 
 
 def should_auto_disable_deep_gemm(model_type: str | None) -> bool:
-    """Check if DeepGemm should be auto-disabled for this model on Blackwell.
-
-    Returns True if the model is known to have accuracy degradation with
-    DeepGemm's E8M0 scale format on Blackwell GPUs (SM100+).
-    """
+    """Check whether this model should avoid DeepGEMM on the current GPU."""
     if model_type is None:
         return False
-    if not (
-        current_platform.is_device_capability_family(100)
-        or current_platform.is_device_capability_family(120)
-    ):
-        return False
-    return model_type in _DEEPGEMM_BLACKWELL_EXCLUDED_MODEL_TYPES
+    return any(
+        current_platform.is_device_capability_family(family)
+        for family in _DEEPGEMM_EXCLUDED_MODEL_TYPES.get(model_type, ())
+    )
 
 
 class DeepGemmQuantScaleFMT(Enum):
