@@ -1531,8 +1531,7 @@ class VllmConfig:
             if should_auto_disable_deep_gemm(model_type):
                 self.quant_config.use_deep_gemm = False
                 logger.warning_once(
-                    "Auto-disabled DeepGEMM for model_type=%s on this GPU "
-                    "due to known accuracy issues. "
+                    "Auto-disabled DeepGEMM for model_type=%s on this GPU. "
                     "To disable DeepGEMM globally, set VLLM_USE_DEEP_GEMM=0.",
                     model_type,
                 )

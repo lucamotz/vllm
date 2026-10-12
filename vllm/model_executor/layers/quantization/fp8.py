@@ -80,7 +80,6 @@ from vllm.model_executor.utils import (
 )
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import (
-    is_deep_gemm_e8m0_used,
     is_deep_gemm_supported,
 )
 
@@ -482,9 +481,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: Fp8Config, layer: RoutedExperts):
         super().__init__(layer.moe_config)
         self.quant_config = quant_config
-        self.use_ue8m0 = (
-            quant_config.use_deep_gemm is not False and is_deep_gemm_e8m0_used()
-        )
         self.weight_block_size = self.quant_config.weight_block_size
         self.block_quant: bool = self.weight_block_size is not None
         self.weight_scale_name = (
@@ -786,7 +782,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer=layer,
         )
 
-        quant_config.use_ue8m0 = self.use_ue8m0
+        if self.quant_config.use_deep_gemm is False:
+            quant_config.use_ue8m0 = False
 
         # Inject biases into the quant config if the model has them
         # (e.g. GPT-OSS biased MoE)
